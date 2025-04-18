@@ -11,17 +11,19 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/AST/ASTContext.h"
+#include "clang/Basic/DiagnosticParse.h"
 #include "clang/Basic/PragmaKinds.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Lex/Token.h"
 #include "clang/Parse/LoopHint.h"
-#include "clang/Parse/ParseDiagnostic.h"
 #include "clang/Parse/Parser.h"
 #include "clang/Parse/RAIIObjectsForParser.h"
 #include "clang/Sema/EnterExpressionEvaluationContext.h"
 #include "clang/Sema/Scope.h"
 #include "clang/Sema/SemaCUDA.h"
+#include "clang/Sema/SemaCodeCompletion.h"
+#include "clang/Sema/SemaRISCV.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringSwitch.h"
 #include <optional>
@@ -1417,16 +1419,16 @@ bool Parser::HandlePragmaLoopHint(LoopHint &Hint) {
       static_cast<PragmaLoopHintInfo *>(Tok.getAnnotationValue());
 
   IdentifierInfo *PragmaNameInfo = Info->PragmaName.getIdentifierInfo();
-  Hint.PragmaNameLoc = IdentifierLoc::create(
-      Actions.Context, Info->PragmaName.getLocation(), PragmaNameInfo);
+  Hint.PragmaNameLoc = new (Actions.Context)
+      IdentifierLoc(Info->PragmaName.getLocation(), PragmaNameInfo);
 
   // It is possible that the loop hint has no option identifier, such as
   // #pragma unroll(4).
   IdentifierInfo *OptionInfo = Info->Option.is(tok::identifier)
                                    ? Info->Option.getIdentifierInfo()
                                    : nullptr;
-  Hint.OptionLoc = IdentifierLoc::create(
-      Actions.Context, Info->Option.getLocation(), OptionInfo);
+  Hint.OptionLoc = new (Actions.Context)
+      IdentifierLoc(Info->Option.getLocation(), OptionInfo);
 
   llvm::ArrayRef<Token> Toks = Info->Toks;
 
@@ -1506,7 +1508,7 @@ bool Parser::HandlePragmaLoopHint(LoopHint &Hint) {
     if (Toks.size() > 2)
       Diag(Tok.getLocation(), diag::warn_pragma_extra_tokens_at_eol)
           << PragmaLoopHintString(Info->PragmaName, Info->Option);
-    Hint.StateLoc = IdentifierLoc::create(Actions.Context, StateLoc, StateInfo);
+    Hint.StateLoc = new (Actions.Context) IdentifierLoc(StateLoc, StateInfo);
   } else if (OptionInfo && OptionInfo->getName() == "vectorize_width") {
     PP.EnterTokenStream(Toks, /*DisableMacroExpansion=*/false,
                         /*IsReinject=*/false);
@@ -1527,8 +1529,7 @@ bool Parser::HandlePragmaLoopHint(LoopHint &Hint) {
           ConsumeAnyToken();
       }
 
-      Hint.StateLoc =
-          IdentifierLoc::create(Actions.Context, StateLoc, StateInfo);
+      Hint.StateLoc = new (Actions.Context) IdentifierLoc(StateLoc, StateInfo);
 
       ConsumeToken(); // Consume the constant expression eof terminator.
     } else {
@@ -1552,7 +1553,7 @@ bool Parser::HandlePragmaLoopHint(LoopHint &Hint) {
           Arg2Error = true;
         } else
           Hint.StateLoc =
-              IdentifierLoc::create(Actions.Context, StateLoc, StateInfo);
+              new (Actions.Context) IdentifierLoc(StateLoc, StateInfo);
 
         PP.Lex(Tok); // Identifier
       }
@@ -1924,7 +1925,8 @@ void Parser::HandlePragmaAttribute() {
     if (Tok.is(tok::code_completion)) {
       cutOffParsing();
       // FIXME: suppress completion of unsupported attributes?
-      Actions.CodeCompleteAttribute(AttributeCommonInfo::Syntax::AS_GNU);
+      Actions.CodeCompletion().CodeCompleteAttribute(
+          AttributeCommonInfo::Syntax::AS_GNU);
       return SkipToEnd();
     }
 
@@ -2123,6 +2125,7 @@ void PragmaGCCVisibilityHandler::HandlePragma(Preprocessor &PP,
 //   pack '(' [integer] ')'
 //   pack '(' 'show' ')'
 //   pack '(' ('push' | 'pop') [',' identifier] [, integer] ')'
+//   pack '(' 'packed' | 'full' | 'twobyte' | 'reset' ')' with -fzos-extensions
 void PragmaPackHandler::HandlePragma(Preprocessor &PP,
                                      PragmaIntroducer Introducer,
                                      Token &PackTok) {
@@ -2152,9 +2155,34 @@ void PragmaPackHandler::HandlePragma(Preprocessor &PP,
                  ? Sema::PSK_Push_Set
                  : Sema::PSK_Set;
   } else if (Tok.is(tok::identifier)) {
+    // Map pragma pack options to pack (integer).
+    auto MapPack = [&](const char *Literal) {
+      Action = Sema::PSK_Push_Set;
+      Alignment = Tok;
+      Alignment.setKind(tok::numeric_constant);
+      Alignment.setLiteralData(Literal);
+      Alignment.setLength(1);
+    };
+
     const IdentifierInfo *II = Tok.getIdentifierInfo();
     if (II->isStr("show")) {
       Action = Sema::PSK_Show;
+      PP.Lex(Tok);
+    } else if (II->isStr("packed") && PP.getLangOpts().ZOSExt) {
+      // #pragma pack(packed) is the same as #pragma pack(1)
+      MapPack("1");
+      PP.Lex(Tok);
+    } else if (II->isStr("full") && PP.getLangOpts().ZOSExt) {
+      // #pragma pack(full) is the same as #pragma pack(4)
+      MapPack("4");
+      PP.Lex(Tok);
+    } else if (II->isStr("twobyte") && PP.getLangOpts().ZOSExt) {
+      // #pragma pack(twobyte) is the same as #pragma pack(2)
+      MapPack("2");
+      PP.Lex(Tok);
+    } else if (II->isStr("reset") && PP.getLangOpts().ZOSExt) {
+      // #pragma pack(reset) is the same as #pragma pack(pop) on XL
+      Action = Sema::PSK_Pop;
       PP.Lex(Tok);
     } else {
       if (II->isStr("push")) {
@@ -4152,7 +4180,7 @@ void PragmaRISCVHandler::HandlePragma(Preprocessor &PP,
   }
 
   if (II->isStr("vector"))
-    Actions.DeclareRISCVVBuiltins = true;
+    Actions.RISCV().DeclareRVVBuiltins = true;
   else if (II->isStr("sifive_vector"))
-    Actions.DeclareRISCVSiFiveVectorBuiltins = true;
+    Actions.RISCV().DeclareSiFiveVectorBuiltins = true;
 }

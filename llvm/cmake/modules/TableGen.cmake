@@ -68,7 +68,9 @@ function(tablegen project ofn)
   # char literals, instead. If we're cross-compiling, then conservatively assume
   # that the source might be consumed by MSVC.
   # [1] https://docs.microsoft.com/en-us/cpp/cpp/compiler-limits?view=vs-2017
-  if (MSVC AND project STREQUAL LLVM)
+  # Don't pass this flag to mlir-src-sharder, since it doesn't support the
+  # flag, and it doesn't need it.
+  if (MSVC AND NOT "${project}" STREQUAL "MLIR_SRC_SHARDER")
     list(APPEND LLVM_TABLEGEN_FLAGS "--long-string-literals=0")
   endif()
   if (CMAKE_GENERATOR MATCHES "Visual Studio")
@@ -167,7 +169,8 @@ function(add_public_tablegen_target target)
   if(LLVM_COMMON_DEPENDS)
     add_dependencies(${target} ${LLVM_COMMON_DEPENDS})
   endif()
-  set_target_properties(${target} PROPERTIES FOLDER "Tablegenning")
+  get_subproject_title(subproject_title)
+  set_target_properties(${target} PROPERTIES FOLDER "${subproject_title}/Tablegenning")
   set(LLVM_COMMON_DEPENDS ${LLVM_COMMON_DEPENDS} ${target} PARENT_SCOPE)
 endfunction()
 
@@ -217,6 +220,8 @@ macro(add_tablegen target project)
       set(${project}_TABLEGEN_EXE ${${project}_TABLEGEN_EXE} PARENT_SCOPE)
 
       add_custom_target(${target}-host DEPENDS ${${project}_TABLEGEN_EXE})
+      get_subproject_title(subproject_title)
+      set_target_properties(${target}-host PROPERTIES FOLDER "${subproject_title}/Native")
       set(${project}_TABLEGEN_TARGET ${target}-host PARENT_SCOPE)
 
       # If we're using the host tablegen, and utils were not requested, we have no
